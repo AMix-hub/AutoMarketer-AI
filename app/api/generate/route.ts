@@ -1,7 +1,31 @@
 import { NextRequest, NextResponse } from "next/server";
 import OpenAI from "openai";
+import { auth } from "@clerk/nextjs/server";
+import { prisma } from "../../../lib/prisma";
+import type { Prisma } from "../../generated/prisma/client";
 
 export async function POST(req: NextRequest) {
+  // Require authentication
+  const { userId } = await auth();
+  if (!userId) {
+    return NextResponse.json({ error: "Unauthorized." }, { status: 401 });
+  }
+
+  // Fetch user record
+  const user = await prisma.user.findUnique({ where: { clerkId: userId } });
+  if (!user) {
+    return NextResponse.json({ error: "User not found." }, { status: 404 });
+  }
+
+  // Check access: active subscription OR credits remaining
+  const hasAccess = user.subscriptionStatus === "active" || user.credits > 0;
+  if (!hasAccess) {
+    return NextResponse.json(
+      { error: "No active subscription or credits. Please visit /billing." },
+      { status: 403 }
+    );
+  }
+
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
     return NextResponse.json(
@@ -53,12 +77,30 @@ Respond with valid JSON matching this exact structure (no markdown code fences):
     try {
       parsed = JSON.parse(raw);
     } catch {
-      // Fallback: return raw text as the blog article if JSON parsing fails
       parsed = {
         blogArticle: raw,
         linkedinPosts: [],
       };
     }
+
+    // Save generation to database and deduct credit if not subscribed
+    await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+      await tx.generation.create({
+        data: {
+          userId: user.id,
+          prompt,
+          blogArticle: parsed.blogArticle,
+          linkedinPosts: JSON.stringify(parsed.linkedinPosts),
+        },
+      });
+
+      if (user.subscriptionStatus !== "active" && user.credits > 0) {
+        await tx.user.update({
+          where: { id: user.id },
+          data: { credits: { decrement: 1 } },
+        });
+      }
+    });
 
     return NextResponse.json(parsed);
   } catch (err: unknown) {
